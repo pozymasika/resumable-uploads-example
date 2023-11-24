@@ -7,10 +7,10 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "client": "cd packages/frontend && bun start",
-    "server": "cd packages/backend && DEBUG=backend:* bun start",
+    "server": "cd packages/backend && bun start",
     "start": "concurrently \"bun client\" \"bun server\"",
     "client:dev": "cd packages/frontend && bun dev",
-    "server:dev": "cd packages/backend && DEBUG=backend:* bun dev",
+    "server:dev": "cd packages/backend && bun dev",
     "dev": "concurrently \"bun client:dev\" \"bun server:dev\""
   },
   "workspaces": [

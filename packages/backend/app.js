@@ -1,95 +1,103 @@
 var express = require("express");
-var path = require("path");
-var cookieParser = require("cookie-parser");
-var logger = require("morgan");
-var app = express();
 var Busboy = require("busboy");
-var { parse } = require("content-range");
 var util = require("util");
 var fs = require("fs");
+var path = require("path");
 var MultiStream = require("multistream");
+var debug = require("debug")("backend:server");
 
-// app.use(logger("dev"));
-// app.use(express.json());
-// app.use(express.urlencoded({ extended: false }));
-// app.use(cookieParser());
-// app.use(express.static(path.join(__dirname, "public")));
+const app = express();
 
-// an upload route that supports resumability using range headers
+function prettyBytes(bytes = 0, decimals = 2) {
+  if (bytes == 0) return "0 Bytes";
+  var k = 1024,
+    sizes = ["Bytes", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"],
+    i = Math.floor(Math.log(bytes) / Math.log(k));
+  return (
+    parseFloat((bytes / Math.pow(k, i)).toFixed(decimals)) + " " + sizes[i]
+  );
+}
+
+/**
+ * parses a range header: bytes 0-99/1000
+ * @param {string} range
+ * @returns {{start: number, end: number, total: number}}}
+ */
+function parseRange(range) {
+  // bytes 0-99/1000
+  var parts = range.replace(/bytes /, "").split("/");
+  var rangeParts = parts[0].split("-");
+  var start = parseInt(rangeParts[0], 10);
+  var end = parseInt(rangeParts[1], 10);
+  var total = parseInt(parts[1], 10);
+  return { start, end, total };
+}
+
+// receive a file upload
 app.post("/upload", (req, res) => {
   var busboy = Busboy({ headers: req.headers });
-  busboy.on("file", (name, file, info) => {
-    const chunkSize = req.headers["chunk-size"];
-    const fileId = req.headers["unique-file-id"];
-    const filename = fileId;
-    const contentRangeHeader = req.headers["content-range"];
-    const contentRange = parse(contentRangeHeader);
-
-    if (!contentRange) {
-      return res.status(400).json({
-        error: "Invalid Content-Range header",
-      });
-    }
-
-    const part = contentRange.start / chunkSize;
-    const partFilename = util.format("%i.part", part);
-    const tmpDirName = util.format("./tmp/%s", fileId);
-    console.log("partFilename: ", partFilename);
+  busboy.on("file", (fieldName, file, info) => {
+    // inspect the range headers
+    var chunkSize = req.headers["chunk-size"];
+    var fileId = req.headers["file-id"];
+    var contentRangeHeader = req.headers["content-range"];
+    var range = parseRange(contentRangeHeader);
+    // determine the chunk being sent
+    var part = range.start / chunkSize; // 3000 / 1000 = 3
+    // save chunk to temp file
+    var partFilename = util.format("%i.part", part); // 0.part, 1.part
+    var tmpDirName = util.format("./tmp/%s", fileId);
+    debug(
+      `Uploading chunk ${prettyBytes(range.start)} - ${prettyBytes(
+        range.end
+      )} of ${prettyBytes(range.total)}`
+    );
 
     if (!fs.existsSync(tmpDirName)) {
       fs.mkdirSync(tmpDirName, { recursive: true });
     }
 
-    const partFilePath = path.join(tmpDirName, partFilename);
-    const writableStream = fs.createWriteStream(partFilePath);
-    file.pipe(writableStream);
+    var partFilePath = path.join(tmpDirName, partFilename);
+    var writeStream = fs.createWriteStream(partFilePath);
+    file.pipe(writeStream);
 
     file.on("end", () => {
-      const isLastPart = contentRange.size === contentRange.end + 1;
-      console.log("isLastPart: ", isLastPart, { contentRange });
+      // once complete, combine chunks into one file
+      var isLastPart = range.total === range.end + 1;
       if (isLastPart) {
-        const totalParts = Math.ceil(contentRange.size / chunkSize);
-        const parts = [...Array(totalParts).keys()];
-        const partFiles = parts.map((part) => {
-          return path.join(tmpDirName, util.format("%i.part", part));
-        });
+        var totalParts = Math.ceil(range.total / chunkSize);
+        debug(`Combining ${totalParts} chunks into ${fileId}`);
 
-        const destFilePath = path.join("./uploads", filename);
+        var fileParts = [];
+        for (var i = 0; i < totalParts; i++) {
+          fileParts.push(path.join(tmpDirName, util.format("%i.part", i)));
+        }
+
+        var destFilePath = path.join("./uploads", fileId);
         if (!fs.existsSync("./uploads")) {
           fs.mkdirSync("./uploads", { recursive: true });
         }
 
-        const fileDescriptor = fs.openSync(destFilePath, "w");
-        const outputStream = fs.createWriteStream(destFilePath);
-        const inputListStream = partFiles.map((file) =>
-          fs.createReadStream(file)
-        );
+        var outPutStream = fs.createWriteStream(destFilePath);
+        var inputStream = fileParts.map((part) => fs.createReadStream(part));
+        var combinedStream = new MultiStream(inputStream);
+        combinedStream.pipe(outPutStream);
 
-        const combinedStream = new MultiStream(inputListStream);
-        combinedStream.pipe(outputStream);
         combinedStream.on("end", () => {
-          fs.closeSync(fileDescriptor);
-          // remove tmp files
-          partFiles.forEach((file) => fs.unlinkSync(file));
-          res.status(200).json({
-            message: "File uploaded successfully",
-          });
+          debug(`Final file saved to ${destFilePath}`);
+          // delete tmp dir
+          fs.rmSync(tmpDirName, { recursive: true });
+          res.status(200).send("ok");
         });
 
         combinedStream.on("error", (err) => {
-          fs.closeSync(fileDescriptor);
-          res.status(500).json({
-            error: err,
-          });
+          res.status(500).send(err);
         });
       } else {
-        res.status(200).json({
-          message: "Chunk uploaded successfully",
-        });
+        res.status(200).send("ok");
       }
     });
   });
-
   req.pipe(busboy);
 });
 
